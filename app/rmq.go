@@ -53,6 +53,7 @@ type rmq struct {
 
 	isConnected bool
 	alive       bool
+	d           bool
 }
 
 func New(cfg *config.Config, params *Params) Rmq {
@@ -63,6 +64,7 @@ func New(cfg *config.Config, params *Params) Rmq {
 		queue:    params.Queue,
 		routeKey: params.RouteKey,
 		alive:    true,
+		d:        false,
 	}
 
 	rmq.wg.Add(2)
@@ -169,11 +171,11 @@ func (r *rmq) connect(cfg *config.Config) bool {
 		return false
 	}
 
-	go func() {
-		for d := range recvQ {
-			fmt.Printf("Recieved Message: %s\n", d.Body)
-		}
-	}()
+	// go func() {
+	// 	for d := range recvQ {
+	// 		fmt.Printf("Recieved Message: %s\n", d.Body)
+	// 	}
+	// }()
 
 	r.recvQ = recvQ
 
@@ -190,6 +192,7 @@ func (r *rmq) changeConnection(connection *amqp.Connection, channel *amqp.Channe
 	r.notifyConfirm = make(chan amqp.Confirmation)
 	r.channel.NotifyClose(r.notifyClose)
 	r.channel.NotifyPublish(r.notifyConfirm)
+	r.d = true
 }
 
 func (r *rmq) run() {
@@ -197,6 +200,10 @@ func (r *rmq) run() {
 
 main:
 	for {
+		if !r.d {
+			continue
+		}
+
 		select {
 		case <-r.close:
 			break main
