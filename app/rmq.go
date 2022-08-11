@@ -49,6 +49,7 @@ type rmq struct {
 
 	queue    string
 	routeKey []string
+	q        string
 
 	isConnected bool
 	alive       bool
@@ -118,9 +119,9 @@ func (r *rmq) connect(cfg *config.Config) bool {
 
 	q, err := ch.QueueDeclare(
 		"",
-		true,  // Durable
-		true,  // Delete when unused
-		false, // Exclusive
+		false, // Durable
+		false, // Delete when unused
+		true,  // Exclusive
 		false, // No-wait
 		nil,   // Arguments
 	)
@@ -128,13 +129,14 @@ func (r *rmq) connect(cfg *config.Config) bool {
 		logrus.Errorf(`declare %s queue error: %v`, r.queue, err)
 		return false
 	}
+	r.q = q.Name
 
-	exchange := `direct_logs`
+	exchange := "logs"
 	if err := ch.ExchangeDeclare(
 		exchange,
 		amqp.ExchangeDirect,
 		true,
-		true,
+		false,
 		false,
 		false,
 		nil,
@@ -143,17 +145,17 @@ func (r *rmq) connect(cfg *config.Config) bool {
 
 		return false
 	}
-	
-	for _, key := range r.routeKey {
-		if err := ch.QueueBind(q.Name, key, exchange, false, nil); err != nil {
-			logrus.Errorf(`bind queue %s error: %v`, r.queue, err)
 
-			return false
-		}
+	if err := ch.QueueBind(q.Name, "wkey", exchange, false, nil); err != nil {
+		logrus.Errorf(`bind queue %s error: %v`, r.queue, err)
+
+		return false
 	}
+	// for _, _ = range r.routeKey {
+	// }
 
 	recvQ, err := ch.Consume(
-		r.queue,
+		q.Name,
 		"",
 		true,
 		false,
@@ -166,6 +168,13 @@ func (r *rmq) connect(cfg *config.Config) bool {
 
 		return false
 	}
+
+	go func() {
+		for d := range recvQ {
+			fmt.Printf("Recieved Message: %s\n", d.Body)
+		}
+	}()
+
 	r.recvQ = recvQ
 
 	r.changeConnection(conn, ch)
@@ -188,18 +197,14 @@ func (r *rmq) run() {
 
 main:
 	for {
-		if !r.isConnected {
-			continue
-		}
-
 		select {
 		case <-r.close:
 			break main
 
-		case msg, ok := <-r.recvQ:
-			if !ok {
-				continue
-			}
+		case msg := <-r.recvQ:
+			// if !ok {
+			// 	continue
+			// }
 
 			logrus.Infof("Msg from %+s: %s", r.routeKey[:], string(msg.Body))
 		}
@@ -216,14 +221,16 @@ func (r *rmq) Close() error {
 		close(r.close)
 		r.wg.Wait()
 
-		err := r.channel.Close()
-		if err != nil {
-			return err
+		if r.channel != nil {
+			if err := r.channel.Close(); err != nil {
+				return err
+			}
 		}
 
-		err = r.connection.Close()
-		if err != nil {
-			return err
+		if r.connection != nil {
+			if err := r.connection.Close(); err != nil {
+				return err
+			}
 		}
 
 		return nil
