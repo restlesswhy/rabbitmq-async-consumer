@@ -13,10 +13,13 @@ import (
 func main() {
 	cfg := config.Load()
 
-	consumer := app.New(cfg, &app.Params{
+	consumer, err := app.New(cfg, &app.Params{
 		Exchange:  "logs",
-		RouteKeys: []string{"warn_key"},
+		RouteKeys: []string{"error_key", "warn_key"},
 	})
+	if err != nil {
+		logrus.Fatal(err)
+	}
 
 	grace := make(chan os.Signal, 1)
 	signal.Notify(grace, os.Interrupt)

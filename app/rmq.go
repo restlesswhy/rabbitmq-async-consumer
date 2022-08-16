@@ -1,7 +1,7 @@
 package app
 
 import (
-	"fmt"
+	"encoding/json"
 	"io"
 	"rabbit/config"
 	"sync"
@@ -54,9 +54,12 @@ type rmq struct {
 
 func New(cfg *config.Config, params *Params) (Rmq, error) {
 	rmq := &rmq{
-		wg:    &sync.WaitGroup{},
-		cfg:   cfg,
-		close: make(chan struct{}),
+		wg:        &sync.WaitGroup{},
+		cfg:       cfg,
+		close:     make(chan struct{}),
+		recvQ:     make(<-chan amqp.Delivery),
+		exchange:  params.Exchange,
+		routeKeys: params.RouteKeys,
 	}
 
 	if err := rmq.Connect(); err != nil {
@@ -86,8 +89,20 @@ func (r *rmq) Connect() error {
 	r.notifyClose = make(chan *amqp.Error)
 	r.connection.NotifyClose(r.notifyClose)
 
+	q, err := r.channel.QueueDeclare(
+		"",
+		false, // Durable
+		false, // Delete when unused
+		true,  // Exclusive
+		false, // No-wait
+		nil,   // Arguments
+	)
+	if err != nil {
+		return errors.Wrap(err, `declare queue error`)
+	}
+
 	if err := r.channel.ExchangeDeclare(
-		r.exchange,      // name
+		r.exchange,          // name
 		amqp.ExchangeDirect, // type
 		true,                // durable
 		false,               // auto-deleted
@@ -98,7 +113,27 @@ func (r *rmq) Connect() error {
 		return errors.Wrap(err, "declare exchange error")
 	}
 
+	for _, v := range r.routeKeys {
+		if err := r.channel.QueueBind(q.Name, v, r.exchange, false, nil); err != nil {
+			return errors.Wrap(err, `bind queue error`)
+		}
+	}
+
+	recvQ, err := r.channel.Consume(
+		q.Name,
+		"",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		return errors.Wrap(err, `consume queue error`)
+	}
+
 	r.isConnected = true
+	r.recvQ = recvQ
 
 	return nil
 }
@@ -154,134 +189,12 @@ func (r *rmq) handleRec() {
 	}
 }
 
-
-func (r *rmq) handleReconnect() {
-	defer func() {
-		r.wg.Done()
-		logrus.Printf("Stop reconnecting to rabbitMQ")
-	}()
-
-	for r.alive {
-		r.isConnected = false
-		t := time.Now()
-		fmt.Printf("Attempting to connect to rabbitMQ: %s\n", r.cfg.Addr)
-		var retryCount int
-		for !r.connect(r.cfg) {
-			if !r.alive {
-				return
-			}
-			select {
-			case <-r.close:
-				return
-			case <-time.After(reconnectDelay + time.Duration(retryCount)*time.Second):
-				logrus.Printf("disconnected from rabbitMQ and failed to connect")
-				retryCount++
-			}
-		}
-		logrus.Printf("Connected to rabbitMQ in: %vms", time.Since(t).Milliseconds())
-		select {
-		case <-r.close:
-			return
-		case <-r.notifyClose:
-		}
-	}
-}
-
-func (r *rmq) connect(cfg *config.Config) bool {
-	conn, err := amqp.Dial(cfg.Addr)
-	if err != nil {
-		logrus.Errorf(`dial rabbit error: %v`, err)
-		return false
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		logrus.Errorf(`conn to channel error: %v`, err)
-		return false
-	}
-
-	q, err := ch.QueueDeclare(
-		"",
-		false, // Durable
-		false, // Delete when unused
-		true,  // Exclusive
-		false, // No-wait
-		nil,   // Arguments
-	)
-	if err != nil {
-		logrus.Errorf(`declare %s queue error: %v`, r.queue, err)
-		return false
-	}
-	r.q = q.Name
-
-	exchange := "logs"
-	if err := ch.ExchangeDeclare(
-		exchange,
-		amqp.ExchangeDirect,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		logrus.Errorf(`declare exchange %s error: %v`, exchange, err)
-
-		return false
-	}
-
-	if err := ch.QueueBind(q.Name, "warn_key", exchange, false, nil); err != nil {
-		logrus.Errorf(`bind queue %s error: %v`, r.queue, err)
-
-		return false
-	}
-	// for _, _ = range r.routeKey {
-	// }
-
-	recvQ, err := ch.Consume(
-		q.Name,
-		"",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		logrus.Errorf(`consume queue %s error: %v`, r.queue, err)
-
-		return false
-	}
-
-	// go func() {
-	// 	for d := range recvQ {
-	// 		fmt.Printf("Recieved Message: %s\n", d.Body)
-	// 	}
-	// }()
-
-	r.recvQ = recvQ
-
-	r.changeConnection(conn, ch)
-	r.isConnected = true
-
-	return true
-}
-
-func (r *rmq) changeConnection(connection *amqp.Connection, channel *amqp.Channel) {
-	r.connection = connection
-	r.channel = channel
-	r.notifyClose = make(chan *amqp.Error)
-	r.notifyConfirm = make(chan amqp.Confirmation)
-	r.channel.NotifyClose(r.notifyClose)
-	r.channel.NotifyPublish(r.notifyConfirm)
-	r.d = true
-}
-
 func (r *rmq) run() {
 	defer r.wg.Done()
 
 main:
 	for {
-		if !r.d {
+		if !r.isConnected {
 			continue
 		}
 
@@ -289,12 +202,19 @@ main:
 		case <-r.close:
 			break main
 
-		case msg := <-r.recvQ:
-			// if !ok {
-			// 	continue
-			// }
+		case msg, ok := <-r.recvQ:
+			if !ok {
+				continue
+			}
 
-			logrus.Infof("Msg from %+s: %s", r.routeKeys[:], string(msg.Body))
+			res := &Message{}
+
+			if err := json.Unmarshal(msg.Body, res); err != nil {
+				logrus.Error("Failed unmarshal message: %v", string(msg.Body))
+				continue
+			}
+
+			logrus.Infof("Msg from %+s: %s", r.routeKeys[:], res.Text)
 		}
 	}
 
