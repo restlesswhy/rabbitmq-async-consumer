@@ -23,8 +23,8 @@ const (
 var ErrClosed = errors.New("rmq closed")
 
 type Params struct {
-	Queue    string
-	RouteKey []string
+	Exchange  string
+	RouteKeys []string
 }
 
 type Message struct {
@@ -39,40 +39,121 @@ type rmq struct {
 	wg  *sync.WaitGroup
 	cfg *config.Config
 
-	connection    *amqp.Connection
-	channel       *amqp.Channel
-	notifyClose   chan *amqp.Error
-	notifyConfirm chan amqp.Confirmation
-	recvQ         <-chan amqp.Delivery
+	connection  *amqp.Connection
+	channel     *amqp.Channel
+	notifyClose chan *amqp.Error
+
+	recvQ     <-chan amqp.Delivery
+	exchange  string
+	routeKeys []string
 
 	close chan struct{}
 
-	queue    string
-	routeKey []string
-	q        string
-
 	isConnected bool
-	alive       bool
-	d           bool
 }
 
-func New(cfg *config.Config, params *Params) Rmq {
+func New(cfg *config.Config, params *Params) (Rmq, error) {
 	rmq := &rmq{
-		wg:       &sync.WaitGroup{},
-		cfg:      cfg,
-		close:    make(chan struct{}),
-		queue:    params.Queue,
-		routeKey: params.RouteKey,
-		alive:    true,
-		d:        false,
+		wg:    &sync.WaitGroup{},
+		cfg:   cfg,
+		close: make(chan struct{}),
+	}
+
+	if err := rmq.Connect(); err != nil {
+		return nil, errors.Wrap(err, "connect or rabbitmq error")
 	}
 
 	rmq.wg.Add(2)
-	go rmq.handleReconnect()
+	go rmq.listenCloseConn()
 	go rmq.run()
 
-	return rmq
+	return rmq, nil
 }
+
+func (r *rmq) Connect() error {
+	var err error
+
+	r.connection, err = amqp.Dial(r.cfg.Addr)
+	if err != nil {
+		return errors.Wrap(err, `dial rabbit error`)
+	}
+
+	r.channel, err = r.connection.Channel()
+	if err != nil {
+		return errors.Wrap(err, `conn to channel error`)
+	}
+
+	r.notifyClose = make(chan *amqp.Error)
+	r.connection.NotifyClose(r.notifyClose)
+
+	if err := r.channel.ExchangeDeclare(
+		r.exchange,      // name
+		amqp.ExchangeDirect, // type
+		true,                // durable
+		false,               // auto-deleted
+		false,               // internal
+		false,               // noWait
+		nil,                 // arguments
+	); err != nil {
+		return errors.Wrap(err, "declare exchange error")
+	}
+
+	r.isConnected = true
+
+	return nil
+}
+
+func (r *rmq) listenCloseConn() {
+	defer r.wg.Done()
+
+main:
+	for {
+		select {
+		case <-r.close:
+			break main
+
+		case <-r.notifyClose:
+			if r.isConnected == false {
+				continue
+			}
+
+			r.isConnected = false
+			logrus.Warn("Connection is closed! Trying to reconnect...")
+			r.handleRec()
+		}
+	}
+
+	logrus.Info("Connection listener is closed")
+}
+
+func (r *rmq) handleRec() {
+	attempts := 1
+	for {
+		time.Sleep(reconnectDelay + time.Second*time.Duration(attempts))
+		r.channel = nil
+		r.connection = nil
+
+		select {
+		case <-r.close:
+			logrus.Infof("Stop trying to connect: %v", ErrClosed)
+			return
+
+		default:
+			logrus.Infof("%d attempt to reconnect...", attempts)
+
+			if err := r.Connect(); err != nil {
+				logrus.Errorf("Failed to connect: %v", err)
+				attempts++
+				continue
+			} else {
+				logrus.Info("Successfully connected!")
+				r.isConnected = true
+				return
+			}
+		}
+	}
+}
+
 
 func (r *rmq) handleReconnect() {
 	defer func() {
@@ -148,7 +229,7 @@ func (r *rmq) connect(cfg *config.Config) bool {
 		return false
 	}
 
-	if err := ch.QueueBind(q.Name, "wkey", exchange, false, nil); err != nil {
+	if err := ch.QueueBind(q.Name, "warn_key", exchange, false, nil); err != nil {
 		logrus.Errorf(`bind queue %s error: %v`, r.queue, err)
 
 		return false
@@ -213,7 +294,7 @@ main:
 			// 	continue
 			// }
 
-			logrus.Infof("Msg from %+s: %s", r.routeKey[:], string(msg.Body))
+			logrus.Infof("Msg from %+s: %s", r.routeKeys[:], string(msg.Body))
 		}
 	}
 

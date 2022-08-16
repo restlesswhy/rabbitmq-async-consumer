@@ -7,8 +7,6 @@ import (
 )
 
 type Config struct {
-	PullQueue string `mapstructure:"PULL_QUEUE"`
-	PushQueue string `mapstructure:"PUSH_QUEUE"`
 	Addr      string `mapstructure:"ADDR"`
 }
 
